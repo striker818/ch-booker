@@ -399,7 +399,9 @@ def main():
                                   f"Book it {where} NOW.", cfg["url"])
                         else:
                             log(f"Still stuck on {slot} ({e}), retrying")
-                        if not SERVER:
+                        if SERVER:
+                            time.sleep(next_wait(state, cfg.get("every", CHECK_EVERY_SECONDS)))
+                        else:
                             input("\nFinish booking in the browser window. "
                                   "Press Enter to keep watching, or Control + C to quit... ")
                         continue
