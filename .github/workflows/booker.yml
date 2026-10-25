@@ -1,0 +1,74 @@
+# Runs ch_booker.py around the clock on GitHub's machines.
+#
+# Each run watches for ~5h40m. A new run is scheduled every 5 hours, and the
+# concurrency group makes it wait for the previous one to finish, so a late
+# start (GitHub often delays scheduled runs 5-30 min) still leaves no gap.
+# After each run the learned release times (ch_release_*.json) are committed back.
+
+name: Chrome Hearts booker
+
+on:
+  schedule:
+    - cron: "0 */5 * * *"
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "How many minutes to watch"
+        default: "340"
+      mode:
+        description: "test = fill the Aspen form without booking, nov6 = real booking"
+        default: "nov6"
+
+concurrency:
+  group: booker
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Playwright + Chromium
+        run: |
+          pip install playwright==1.64.1
+          python -m playwright install --with-deps chromium
+
+      - name: Watch and book
+        env:
+          CH_FIRST_NAME: ${{ secrets.CH_FIRST_NAME }}
+          CH_LAST_NAME: ${{ secrets.CH_LAST_NAME }}
+          CH_PHONE: ${{ secrets.CH_PHONE }}
+          CH_EMAIL: ${{ secrets.CH_EMAIL }}
+          CH_GUEST_NAMES: ${{ secrets.CH_GUEST_NAMES }}
+          CH_NTFY_TOPIC: ${{ secrets.CH_NTFY_TOPIC }}
+        run: >
+          python ch_booker.py "${{ inputs.mode || 'nov6' }}"
+          --server --minutes "${{ inputs.minutes || '340' }}"
+
+      - name: Save learned release time
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add ch_release_*.json
+          git diff --cached --quiet && exit 0
+          git commit -m "Update release-time state"
+          git pull --rebase && git push
+
+      - name: Keep screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots-${{ github.run_id }}
+          path: "*.png"
+          if-no-files-found: ignore
+          retention-days: 7
