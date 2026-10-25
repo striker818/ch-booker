@@ -13,8 +13,13 @@ Two modes, picked when you start it:
                                  (Nov 6, Nov 7 once it opens, or anything earlier).
                                  REAL booking (cancel it after). Checks every ~30s.
 
-  python3 ch_booker.py nyc    -> Chrome Hearts NEW YORK WEST VILLAGE, Jan 26.
-                                 Watches for an opening and BOOKS IT for real.
+  python3 ch_booker.py learn  -> NYC West Village, WATCH ONLY. Never books. Records when
+                                 new days get added and pings your phone when it happens.
+
+  python3 ch_booker.py nyc    ->Chrome Hearts NEW YORK WEST VILLAGE, trip days Jan 24-27.
+                                 Books the earliest opening on any of those days, for real.
+                                 (Days only become bookable ~13 days ahead, so until about
+                                 Jan 11 it just reports "not bookable yet".)
 
 It checks about every 60-80 seconds. Stop anytime with Control + C.
 
@@ -102,10 +107,18 @@ MODES = {
         "dry_run": False,
         "every": 30,
     },
+    "learn": {
+        "url": "https://waitwhile.com/locations/chromehearts",
+        "name": "Chrome Hearts New York West Village (WATCH ONLY - never books)",
+        "dates": "any",
+        "dry_run": True,
+        "watch_only": True,
+        "every": 30,
+    },
     "nyc": {
         "url": "https://waitwhile.com/locations/chromehearts",
-        "name": "Chrome Hearts New York West Village",
-        "dates": [("Jan", 26)],
+        "name": "Chrome Hearts New York West Village (trip Jan 24-27)",
+        "dates": [("Jan", 24), ("Jan", 25), ("Jan", 26), ("Jan", 27)],
         "dry_run": False,
     },
 }
@@ -190,8 +203,10 @@ def note_last_date(state, last):
         before = datetime.fromisoformat(prev_check)
         if (now - before).total_seconds() < 15 * 60:
             state.setdefault("releases", []).append({"after": prev_check, "seen": now.isoformat()})
-            log(f"NEW DAY {last} was added between {before:%I:%M:%S %p} and "
-                f"{now:%I:%M:%S %p} New York time. Will check fast around then every day.")
+            msg = (f"New day {last} was added between {before:%I:%M:%S %p} and "
+                   f"{now:%I:%M:%S %p} New York time.")
+            log(f"{msg} Will check fast around then every day.")
+            alert("New Chrome Hearts day added", msg)
         else:
             log(f"New day {last} was added sometime since {before:%b %d %I:%M %p} "
                 f"New York time (script was off, so can't pin down when)")
@@ -339,7 +354,8 @@ def main():
               "  python3 ch_booker.py test   (safe test on Aspen, books nothing)\n"
               "  python3 ch_booker.py aspen  (REAL booking, Aspen Oct 26)\n"
               "  python3 ch_booker.py nov6   (REAL booking, NYC West Village, first open day)\n"
-              "  python3 ch_booker.py nyc    (REAL booking, NYC West Village Jan 26)")
+              "  python3 ch_booker.py learn  (watch only, learns when new days open, never books)\n"
+              "  python3 ch_booker.py nyc    (REAL booking, NYC West Village, Jan 24-27)")
         return
     cfg = MODES[mode]
     dates_txt = ("the first open day" if cfg["dates"] == "any"
@@ -353,9 +369,10 @@ def main():
     global STATE_FILE
     STATE_FILE = Path(__file__).with_name(f"ch_release_{cfg['url'].rstrip('/').split('/')[-1]}.json")
     state = load_state()
-    if state.get("booked") and not cfg["dry_run"]:
-        log(f"Already booked {state['booked']} - not booking again. "
-            f"Remove \"booked\" from {STATE_FILE.name} to start over.")
+    booked_key = f"booked_{mode}"   # per mode, so the Nov 6 booking doesn't block the trip
+    if state.get(booked_key) and not cfg["dry_run"]:
+        log(f"Already booked {state[booked_key]} - not booking again. "
+            f"Remove \"{booked_key}\" from {STATE_FILE.name} to start over.")
         return
     log(f"{cfg['name']} | watching {dates_txt} | {SERVICE}, party of {PARTY_SIZE}. "
         f"Control + C to stop.")
@@ -380,7 +397,12 @@ def main():
                 tiles = page.evaluate(LIST_DATES_JS)
                 if tiles:
                     note_last_date(state, f"{tiles[-1][0]} {tiles[-1][1]}")
-                label, times = find_open_times(page, cfg["dates"])
+                if cfg.get("watch_only"):
+                    log(f"Bookable through {tiles[-1][0]} {tiles[-1][1]}" if tiles
+                        else "couldn't read the date tiles")
+                    label, times = None, []
+                else:
+                    label, times = find_open_times(page, cfg["dates"])
                 if times:
                     log(f"{label} open times: {', '.join(times)}. Grabbing {times[0]}...")
                     start = time.time()
@@ -413,7 +435,7 @@ def main():
                             input("\nTest done. Look over the form in the browser window, "
                                   "then press Enter to close (nothing was booked)... ")
                         return
-                    state["booked"] = f"{label} {times[0]}"
+                    state[booked_key] = f"{label} {times[0]}"
                     STATE_FILE.write_text(json.dumps(state, indent=2))
                     alert("Chrome Hearts booked",
                           f"Booked {label} at {times[0]}. Check {EMAIL} for the confirmation.",

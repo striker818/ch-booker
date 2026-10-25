@@ -16,8 +16,8 @@ on:
         description: "How many minutes to watch"
         default: "340"
       mode:
-        description: "test = fill the Aspen form without booking, nov6 = real booking"
-        default: "nov6"
+        description: "learn = watch only (never books), test = fill the Aspen form without booking, nyc = real booking Jan 24-27"
+        default: "learn"
 
 concurrency:
   group: booker
@@ -51,7 +51,7 @@ jobs:
           CH_GUEST_NAMES: ${{ secrets.CH_GUEST_NAMES }}
           CH_NTFY_TOPIC: ${{ secrets.CH_NTFY_TOPIC }}
         run: >
-          python ch_booker.py "${{ inputs.mode || 'nov6' }}"
+          python ch_booker.py "${{ inputs.mode || 'learn' }}"
           --server --minutes "${{ inputs.minutes || '340' }}"
 
       - name: Save learned release time
