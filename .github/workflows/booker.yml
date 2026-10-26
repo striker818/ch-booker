@@ -52,7 +52,7 @@ jobs:
           CH_NTFY_TOPIC: ${{ secrets.CH_NTFY_TOPIC }}
         run: >
           python ch_booker.py "${{ inputs.mode || 'learn' }}"
-          --server --minutes "${{ inputs.minutes || '340' }}"
+          --server --stagger --minutes "${{ inputs.minutes || '340' }}"
 
       - name: Save tracker data
         if: always()

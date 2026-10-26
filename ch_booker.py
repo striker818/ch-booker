@@ -23,7 +23,8 @@ Two modes, picked when you start it:
                                  (Days only become bookable ~13 days ahead, so until about
                                  Jan 11 it just reports "not bookable yet".)
 
-It checks about every 60-80 seconds. Stop anytime with Control + C.
+It checks every 10 seconds, on the clock (:00, :10, :20... or, with --stagger,
+:05, :15, :25... so two trackers together cover every 5 seconds). Control + C stops it.
 
 It also watches for the moment a new day is added to the booking window, saves it
 in ch_release_<store>.json, and checks every ~5 seconds around that time each day after.
@@ -35,9 +36,9 @@ no browser window, no "press Enter" prompts, alerts go to your phone through ntf
 
 import csv
 import json
+import math
 import os
 import platform
-import random
 import re
 import subprocess
 import sys
@@ -72,7 +73,7 @@ GUEST_NAMES = _setting("GUEST_NAMES")
 PARTY_SIZE = "2"
 SERVICE = "Personal Shopping"
 NTFY_TOPIC = _setting("NTFY_TOPIC")  # phone alerts, e.g. "mike-ch-slots-4821"
-CHECK_EVERY_SECONDS = 60
+CHECK_EVERY_SECONDS = 10
 # =====================================================
 
 # --server: no browser window, no "press Enter" prompts, alerts go to your phone (ntfy).
@@ -80,6 +81,10 @@ SERVER = "--server" in sys.argv
 # --minutes N: stop cleanly after N minutes (GitHub Actions jobs max out at 6 hours).
 _m = re.search(r"--minutes[= ](\d+)", " ".join(sys.argv))
 STOP_AFTER_SECONDS = int(_m.group(1)) * 60 if _m else None
+# --stagger: check halfway between the other tracker's checks. Checks run on the clock
+# (Mac at :00, :10, :20..., GitHub with --stagger at :05, :15, :25...), so together
+# the page gets looked at every 5 seconds.
+STAGGER = "--stagger" in sys.argv
 
 # New days get added to the booking window once a day. The script records when
 # it sees that happen and checks every FAST_EVERY_SECONDS around that time.
@@ -108,7 +113,7 @@ MODES = {
         "name": "Chrome Hearts New York West Village (REAL booking, first open day - cancel after)",
         "dates": "any",
         "dry_run": False,
-        "every": 30,
+        "every": 10,
     },
     "learn": {
         "url": "https://waitwhile.com/locations/chromehearts",
@@ -116,7 +121,7 @@ MODES = {
         "dates": "any",
         "dry_run": True,
         "watch_only": True,
-        "every": 30,
+        "every": 10,
     },
     "nyc": {
         "url": "https://waitwhile.com/locations/chromehearts",
@@ -337,27 +342,47 @@ def merge_github_releases(state):
         log(f"Picked up {len(added)} release time(s) from the GitHub tracker")
 
 
+def merge_openings(*sources):
+    """Combines opening logs from both trackers. When both saw the same slot open (or
+    get taken) within 3 minutes, keeps the earliest sighting."""
+    merged = []
+    for r in sorted((r for rows in sources for r in rows), key=lambda r: r["seen_at_ny"]):
+        seen = datetime.strptime(r["seen_at_ny"], "%Y-%m-%d %H:%M:%S")
+        if any(m["event"] == r["event"] and m["appointment_date"] == r["appointment_date"]
+               and m["appointment_time"] == r["appointment_time"]
+               and abs((seen - datetime.strptime(m["seen_at_ny"], "%Y-%m-%d %H:%M:%S"))
+                       .total_seconds()) <= 180
+               for m in merged):
+            continue
+        merged.append(r)
+    return merged
+
+
 def print_report(slug):
     """python3 ch_booker.py report - patterns in the openings seen so far."""
     from collections import Counter
     from statistics import median
-    # GitHub is the always-on tracker, so its copy wins; the local files are the fallback.
-    csv_text = fetch_from_github(f"ch_openings_{slug}.csv")
-    state_text = fetch_from_github(f"ch_release_{slug}.json")
-    source = "GitHub tracker" if csv_text else "this Mac (couldn't reach GitHub)"
-    if csv_text is None:
-        path = Path(__file__).with_name(f"ch_openings_{slug}.csv")
-        csv_text = path.read_text() if path.exists() else ""
-    if state_text is None:
-        path = Path(__file__).with_name(f"ch_release_{slug}.json")
-        state_text = path.read_text() if path.exists() else "{}"
-    rows = list(csv.DictReader(csv_text.splitlines()))
-    state = json.loads(state_text)
+    # Both trackers write their own copy (GitHub's lives in the repo), so merge them.
+    gh_csv = fetch_from_github(f"ch_openings_{slug}.csv")
+    local = Path(__file__).with_name(f"ch_openings_{slug}.csv")
+    rows = merge_openings(list(csv.DictReader((gh_csv or "").splitlines())),
+                          list(csv.DictReader(local.read_text().splitlines()))
+                          if local.exists() else [])
+    state = {"releases": []}
+    for text in (fetch_from_github(f"ch_release_{slug}.json"),
+                 Path(__file__).with_name(f"ch_release_{slug}.json").read_text()
+                 if Path(__file__).with_name(f"ch_release_{slug}.json").exists() else None):
+        if text:
+            known = {r["seen"] for r in state["releases"]}
+            state["releases"] += [r for r in json.loads(text).get("releases", [])
+                                  if r["seen"] not in known]
     opened = [r for r in rows if r["event"] == "opened"]
     taken = [r for r in rows if r["event"] == "taken" and r["open_for_minutes"] and not r["note"]]
 
     print(f"\n=== Chrome Hearts {slug} - what's been seen so far ===")
-    print(f"(data from: {source}; GitHub saves it at the end of each ~5.5-hour run)\n")
+    print("(GitHub tracker + this Mac combined"
+          f"{'' if gh_csv is not None else ' - GitHub unreachable, Mac only'}; "
+          "GitHub saves at the end of each ~5.5-hour run)\n")
     rel = state.get("releases", [])
     print(f"New days added to the booking window: {len(rel)} seen")
     for r in rel:
@@ -410,21 +435,27 @@ def release_seconds(state):
     return sorted(secs)[len(secs) // 2] if secs else None
 
 
-def next_wait(state, normal_every):
-    """Seconds to sleep before the next check: short near the release time."""
+def wait_period(state, normal_every=CHECK_EVERY_SECONDS):
+    """Seconds between checks right now: FAST_EVERY_SECONDS near the release time."""
     rel = release_seconds(state)
-    jitter = random.uniform(0, 10)
-    if rel is None:
-        return normal_every + jitter
-    now = datetime.now(STORE_TZ)
-    now_s = now.hour * 3600 + now.minute * 60 + now.second
-    diff = (now_s - rel + 43200) % 86400 - 43200   # seconds past release, -12h..+12h
-    if -FAST_BEFORE_MIN * 60 <= diff <= FAST_AFTER_MIN * 60:
-        return FAST_EVERY_SECONDS + random.uniform(0, 2)
-    until_fast = -FAST_BEFORE_MIN * 60 - diff
-    if 0 < until_fast < normal_every + jitter:
-        return until_fast
-    return normal_every + jitter
+    if rel is not None:
+        now = datetime.now(STORE_TZ)
+        now_s = now.hour * 3600 + now.minute * 60 + now.second
+        diff = (now_s - rel + 43200) % 86400 - 43200   # seconds past release, -12h..+12h
+        if -FAST_BEFORE_MIN * 60 <= diff <= FAST_AFTER_MIN * 60:
+            return FAST_EVERY_SECONDS
+    return normal_every
+
+
+def next_wait(state, normal_every):
+    """Seconds to sleep until the next check slot on the clock. Slots are every
+    normal_every seconds (FAST_EVERY_SECONDS near the release time), shifted by half
+    a slot with --stagger. A check that runs long just takes the next free slot."""
+    period = wait_period(state, normal_every)
+    phase = period / 2 if STAGGER else 0
+    now = time.time()
+    next_slot = math.floor((now - phase) / period) * period + phase + period
+    return next_slot - now
 
 
 def release_label(state):
@@ -650,7 +681,7 @@ def main():
                 except Exception:
                     pass
             wait = next_wait(state, cfg.get("every", CHECK_EVERY_SECONDS))
-            fast = wait <= FAST_EVERY_SECONDS + 2
+            fast = wait_period(state) == FAST_EVERY_SECONDS
             if fast != was_fast:
                 log("Release time is close: checking every few seconds" if fast
                     else "Past the release window: back to normal checks")
