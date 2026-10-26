@@ -381,7 +381,7 @@ def scan_open_slots(page, tiles):
     for mon, day in tiles:
         if not page.evaluate(CLICK_DATE_JS, [mon, day]):
             continue
-        page.wait_for_timeout(1500)
+        wait_for_day(page, mon, day)
         body = page.inner_text("body")
         if "No available times this day" in body:
             continue
@@ -635,6 +635,40 @@ def release_label(state):
             f"{'AM' if rel < 43200 else 'PM'} New York time")
 
 
+# Ready = the day tiles are drawn and the selected day says either its times or "No available".
+PICKER_READY_JS = r"""() => document.querySelectorAll('[role="radio"]').length > 0 &&
+    /No available times|\d{1,2}:\d{2}\s?(AM|PM)/.test(document.body.innerText)"""
+FULL_FLOW_EVERY = 60     # checks; a full click-through now and then, in case the page drifts
+
+
+def wait_for_day(page, mon, day):
+    """After clicking a day: wait until the page shows that day ("Friday, Nov 6") and its
+    times or "No available times" - usually well under a second - instead of a fixed pause."""
+    try:
+        page.wait_for_function(
+            r"([mon, day]) => new RegExp(', ' + mon + ' ' + day + '\\b').test(document.body.innerText)",
+            arg=[mon, day], timeout=5000)
+        page.wait_for_function(PICKER_READY_JS, timeout=5000)
+        page.wait_for_timeout(250)      # let the time buttons finish drawing
+    except Exception:
+        page.wait_for_timeout(1500)     # fall back to the old fixed pause
+
+
+def open_date_picker(page, url, full=False):
+    """Gets to the date-and-time page. Once there, a check just reloads that page (about
+    1-2 s instead of ~6 s): the reload asks the store for fresh times and keeps the chosen
+    service and party. Falls back to the full click-through if anything looks off."""
+    if not full and "/time" in page.url:
+        try:
+            page.reload(wait_until="domcontentloaded")
+            page.get_by_text("Select date and time").first.wait_for(timeout=10000)
+            page.wait_for_function(PICKER_READY_JS, timeout=10000)
+            return
+        except Exception as e:
+            log(f"(quick reload didn't work - {type(e).__name__}; doing the full click-through)")
+    go_to_date_picker(page, url)
+
+
 def go_to_date_picker(page, url):
     page.goto(url, wait_until="domcontentloaded")
     page.get_by_text("Schedule a booking", exact=True).first.click(timeout=30000)
@@ -664,7 +698,7 @@ def find_open_times(page, dates, earliest=None, latest=None):
         if not page.evaluate(CLICK_DATE_JS, [mon, day]):
             log(f"{label}: not bookable yet (outside the booking window)")
             continue
-        page.wait_for_timeout(2000)
+        wait_for_day(page, mon, day)
         body = page.inner_text("body")
         if "No available times this day" in body:
             log(f"{label}: in window, no open times")
@@ -802,12 +836,14 @@ def main():
         was_fast = False
         alerted = {}
         started = time.time()
+        checks_done = 0
         while True:
             if STOP_AFTER_SECONDS and time.time() - started > STOP_AFTER_SECONDS:
                 log("Time limit reached, stopping (the next scheduled run picks up from here)")
                 return
             try:
-                go_to_date_picker(page, cfg["url"])
+                checks_done += 1
+                open_date_picker(page, cfg["url"], full=checks_done % FULL_FLOW_EVERY == 1)
                 tiles = page.evaluate(LIST_DATES_JS)
                 greyed = page.evaluate(GREYED_DATES_JS)
                 if tiles:   # only future days waiting to open, not today once it's closed
