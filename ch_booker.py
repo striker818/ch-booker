@@ -14,7 +14,9 @@ Two modes, picked when you start it:
                                  REAL booking (cancel it after). Checks every ~30s.
 
   python3 ch_booker.py learn  -> NYC West Village, WATCH ONLY. Never books. Records when
-                                 new days get added and pings your phone when it happens.
+                                 new days get added, plus every time slot that opens up and
+                                 how long it lasts (ch_openings_chromehearts.csv).
+  python3 ch_booker.py report -> Shows patterns in those openings.
 
   python3 ch_booker.py nyc    ->Chrome Hearts NEW YORK WEST VILLAGE, trip days Jan 24-27.
                                  Books the earliest opening on any of those days, for real.
@@ -31,6 +33,7 @@ no browser window, no "press Enter" prompts, alerts go to your phone through ntf
 (set CH_NTFY_TOPIC).
 """
 
+import csv
 import json
 import os
 import platform
@@ -211,10 +214,191 @@ def note_last_date(state, last):
             log(f"New day {last} was added sometime since {before:%b %d %I:%M %p} "
                 f"New York time (script was off, so can't pin down when)")
     state["last_date"], state["last_check"] = last, now.isoformat()
+    save_state(state)
+
+
+def save_state(state):
     try:
         STATE_FILE.write_text(json.dumps(state, indent=2))
     except Exception as e:
         log(f"(couldn't save {STATE_FILE.name}: {e})")
+
+
+# ----- opening tracker (learn mode): every slot that appears, and how long it lasts -----
+
+OPENINGS_FILE = None   # e.g. ch_openings_chromehearts.csv, set in main()
+OPENINGS_COLUMNS = ["event", "appointment_date", "appointment_weekday", "appointment_time",
+                    "seen_at_ny", "seen_weekday", "days_ahead", "open_for_minutes", "note"]
+
+
+def slot_date(label, now):
+    """'Nov 6' -> date, picking the year that puts it near now (handles Dec -> Jan)."""
+    d = datetime.strptime(f"{label} {now.year}", "%b %d %Y").date()
+    if (d - now.date()).days < -60:
+        d = d.replace(year=now.year + 1)
+    return d
+
+
+def scan_open_slots(page, tiles):
+    """Every open time in the booking window right now, as a set of ("Nov 6", "1:30 PM").
+    Only reads the page - never picks a time."""
+    body = page.inner_text("body")
+    m = re.search(r"No available times for the next (\d+) days", body)
+    if "No available times this day" in body and m and int(m.group(1)) + 1 >= len(tiles):
+        return set()
+    slots = set()
+    for mon, day in tiles:
+        if not page.evaluate(CLICK_DATE_JS, [mon, day]):
+            continue
+        page.wait_for_timeout(1500)
+        body = page.inner_text("body")
+        if "No available times this day" in body:
+            continue
+        slots.update((f"{mon} {day}", t) for t in dict.fromkeys(TIME_RE.findall(body)))
+    return slots
+
+
+def write_opening(row):
+    new_file = not OPENINGS_FILE.exists()
+    with OPENINGS_FILE.open("a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=OPENINGS_COLUMNS)
+        if new_file:
+            w.writeheader()
+        w.writerow(row)
+
+
+def record_openings(state, slots):
+    """Compares with the last check: logs slots that just appeared and ones that got taken."""
+    now = datetime.now(STORE_TZ)
+    prev = {tuple(k.split("|")): v for k, v in state.get("open_slots", {}).items()}
+    last_scan = state.get("slots_checked")
+    gap = (now - datetime.fromisoformat(last_scan)).total_seconds() if last_scan else None
+    unsure = gap is None or gap > 15 * 60   # script was off, so timings are rough
+
+    for day, t in sorted(slots - set(prev)):
+        appt = slot_date(day, now)
+        log(f"OPENING: {day} {t} just appeared")
+        write_opening({"event": "opened", "appointment_date": appt.isoformat(),
+                       "appointment_weekday": appt.strftime("%A"), "appointment_time": t,
+                       "seen_at_ny": now.strftime("%Y-%m-%d %H:%M:%S"),
+                       "seen_weekday": now.strftime("%A"),
+                       "days_ahead": (appt - now.date()).days, "open_for_minutes": "",
+                       "note": "seen after the script was off" if unsure and prev else ""})
+    for (day, t), first_seen in sorted(prev.items()):
+        if (day, t) in slots:
+            continue
+        appt = slot_date(day, now)
+        mins = (now - datetime.fromisoformat(first_seen)).total_seconds() / 60
+        log(f"TAKEN: {day} {t} is gone after about {mins:.0f} min")
+        write_opening({"event": "taken", "appointment_date": appt.isoformat(),
+                       "appointment_weekday": appt.strftime("%A"), "appointment_time": t,
+                       "seen_at_ny": now.strftime("%Y-%m-%d %H:%M:%S"),
+                       "seen_weekday": now.strftime("%A"),
+                       "days_ahead": (appt - now.date()).days,
+                       "open_for_minutes": f"{mins:.1f}",
+                       "note": "script was off for a while, so this is a rough upper bound"
+                               if unsure else ""})
+
+    state["open_slots"] = {f"{d}|{t}": prev.get((d, t), now.isoformat()) for d, t in slots}
+    state["slots_checked"] = now.isoformat()
+    save_state(state)
+
+
+GITHUB_RAW = "https://raw.githubusercontent.com/striker818/ch-booker/main/"
+
+
+def fetch_from_github(name):
+    """A file from the GitHub tracker repo, or None. Uses curl because this Mac's
+    Python can't verify HTTPS certificates."""
+    try:
+        r = subprocess.run(["curl", "-fsSL", "--max-time", "15", GITHUB_RAW + name],
+                           capture_output=True, text=True)
+        return r.stdout if r.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def merge_github_releases(state):
+    """Pulls in the release times the GitHub tracker has learned."""
+    text = fetch_from_github(STATE_FILE.name)
+    if not text:
+        return
+    try:
+        theirs = json.loads(text).get("releases", [])
+    except ValueError:
+        return
+    mine = state.setdefault("releases", [])
+    known = {r["seen"] for r in mine}
+    added = [r for r in theirs if r["seen"] not in known]
+    if added:
+        mine.extend(added)
+        mine.sort(key=lambda r: r["seen"])
+        save_state(state)
+        log(f"Picked up {len(added)} release time(s) from the GitHub tracker")
+
+
+def print_report(slug):
+    """python3 ch_booker.py report - patterns in the openings seen so far."""
+    from collections import Counter
+    from statistics import median
+    # GitHub is the always-on tracker, so its copy wins; the local files are the fallback.
+    csv_text = fetch_from_github(f"ch_openings_{slug}.csv")
+    state_text = fetch_from_github(f"ch_release_{slug}.json")
+    source = "GitHub tracker" if csv_text else "this Mac (couldn't reach GitHub)"
+    if csv_text is None:
+        path = Path(__file__).with_name(f"ch_openings_{slug}.csv")
+        csv_text = path.read_text() if path.exists() else ""
+    if state_text is None:
+        path = Path(__file__).with_name(f"ch_release_{slug}.json")
+        state_text = path.read_text() if path.exists() else "{}"
+    rows = list(csv.DictReader(csv_text.splitlines()))
+    state = json.loads(state_text)
+    opened = [r for r in rows if r["event"] == "opened"]
+    taken = [r for r in rows if r["event"] == "taken" and r["open_for_minutes"] and not r["note"]]
+
+    print(f"\n=== Chrome Hearts {slug} - what's been seen so far ===")
+    print(f"(data from: {source}; GitHub saves it at the end of each ~5.5-hour run)\n")
+    rel = state.get("releases", [])
+    print(f"New days added to the booking window: {len(rel)} seen")
+    for r in rel:
+        print(f"   {datetime.fromisoformat(r['seen']).astimezone(STORE_TZ):%a %b %d}, "
+              f"between {datetime.fromisoformat(r['after']).astimezone(STORE_TZ):%I:%M:%S %p} and "
+              f"{datetime.fromisoformat(r['seen']).astimezone(STORE_TZ):%I:%M:%S %p} NY time")
+    print(f"\nOpenings (a time slot becoming free): {len(opened)} seen")
+    if not opened:
+        print("   none yet")
+        return
+
+    def show(title, values, order=None):
+        c = Counter(values)
+        keys = order if order else [k for k, _ in c.most_common()]
+        print(f"\n{title}")
+        for k in keys:
+            if c[k]:
+                print(f"   {k:<12} {'#' * c[k]} {c[k]}")
+
+    days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    show("Which appointment DAYS opened up:", [r["appointment_weekday"] for r in opened], days)
+    show("Which appointment TIMES opened up:", [r["appointment_time"] for r in opened],
+         sorted({r["appointment_time"] for r in opened},
+                key=lambda t: datetime.strptime(t, "%I:%M %p")))
+    show("Day of the week the opening APPEARED:", [r["seen_weekday"] for r in opened], days)
+    show("Hour (NY time) the opening APPEARED:",
+         [datetime.strptime(r["seen_at_ny"], "%Y-%m-%d %H:%M:%S").strftime("%I %p")
+          for r in opened],
+         sorted({datetime.strptime(r["seen_at_ny"], "%Y-%m-%d %H:%M:%S").strftime("%I %p")
+                 for r in opened}, key=lambda h: datetime.strptime(h, "%I %p")))
+    ahead = [int(r["days_ahead"]) for r in opened]
+    print(f"\nHow far ahead the opened slots were: {min(ahead)} to {max(ahead)} days "
+          f"(typically {median(ahead):.0f})")
+    if taken:
+        mins = [float(r["open_for_minutes"]) for r in taken]
+        print(f"How long an opening lasted before someone took it: typically "
+              f"{median(mins):.1f} min (shortest {min(mins):.1f}, longest {max(mins):.1f}, "
+              f"from {len(mins)} timed)")
+    if len(opened) < 10:
+        print("\n(Fewer than 10 openings so far - too few to call anything a pattern yet.)")
+    print()
 
 
 def release_seconds(state):
@@ -349,12 +533,16 @@ def fill_and_book(page, time_text, dry_run):
 
 def main():
     mode = (sys.argv[1] if len(sys.argv) > 1 else "").lower()
+    if mode == "report":
+        print_report("chromehearts")
+        return
     if mode not in MODES:
         print("Start it with one of these:\n"
               "  python3 ch_booker.py test   (safe test on Aspen, books nothing)\n"
               "  python3 ch_booker.py aspen  (REAL booking, Aspen Oct 26)\n"
               "  python3 ch_booker.py nov6   (REAL booking, NYC West Village, first open day)\n"
               "  python3 ch_booker.py learn  (watch only, learns when new days open, never books)\n"
+              "  python3 ch_booker.py report (patterns in the openings learn mode has seen)\n"
               "  python3 ch_booker.py nyc    (REAL booking, NYC West Village, Jan 24-27)")
         return
     cfg = MODES[mode]
@@ -366,9 +554,13 @@ def main():
         print(f"Missing your details: {', '.join(missing)}. "
               f"Put them in ch_info.json (or CH_* environment variables).")
         sys.exit(1)
-    global STATE_FILE
-    STATE_FILE = Path(__file__).with_name(f"ch_release_{cfg['url'].rstrip('/').split('/')[-1]}.json")
+    global STATE_FILE, OPENINGS_FILE
+    slug = cfg['url'].rstrip('/').split('/')[-1]
+    STATE_FILE = Path(__file__).with_name(f"ch_release_{slug}.json")
+    OPENINGS_FILE = Path(__file__).with_name(f"ch_openings_{slug}.csv")
     state = load_state()
+    if not SERVER:
+        merge_github_releases(state)
     booked_key = f"booked_{mode}"   # per mode, so the Nov 6 booking doesn't block the trip
     if state.get(booked_key) and not cfg["dry_run"]:
         log(f"Already booked {state[booked_key]} - not booking again. "
@@ -398,8 +590,13 @@ def main():
                 if tiles:
                     note_last_date(state, f"{tiles[-1][0]} {tiles[-1][1]}")
                 if cfg.get("watch_only"):
-                    log(f"Bookable through {tiles[-1][0]} {tiles[-1][1]}" if tiles
-                        else "couldn't read the date tiles")
+                    if tiles:
+                        slots = scan_open_slots(page, tiles)
+                        record_openings(state, slots)
+                        log(f"Bookable through {tiles[-1][0]} {tiles[-1][1]} | open now: "
+                            + (", ".join(f"{d} {t}" for d, t in sorted(slots)) or "nothing"))
+                    else:
+                        log("couldn't read the date tiles")
                     label, times = None, []
                 else:
                     label, times = find_open_times(page, cfg["dates"])

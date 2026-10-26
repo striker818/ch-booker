@@ -3,7 +3,7 @@
 # Each run watches for ~5h40m. A new run is scheduled every 5 hours, and the
 # concurrency group makes it wait for the previous one to finish, so a late
 # start (GitHub often delays scheduled runs 5-30 min) still leaves no gap.
-# After each run the learned release times (ch_release_*.json) are committed back.
+# After each run the tracker data (release times + every opening seen) is committed back.
 
 name: Chrome Hearts booker
 
@@ -54,14 +54,14 @@ jobs:
           python ch_booker.py "${{ inputs.mode || 'learn' }}"
           --server --minutes "${{ inputs.minutes || '340' }}"
 
-      - name: Save learned release time
+      - name: Save tracker data
         if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add ch_release_*.json
+          git add ch_release_*.json ch_openings_*.csv
           git diff --cached --quiet && exit 0
-          git commit -m "Update release-time state"
+          git commit -m "Update tracker data"
           git pull --rebase && git push
 
       - name: Keep screenshots

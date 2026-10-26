@@ -1,0 +1,3 @@
+event,appointment_date,appointment_weekday,appointment_time,seen_at_ny,seen_weekday,days_ahead,open_for_minutes,note
+opened,2026-10-26,Monday,6:30 PM,2026-10-25 12:23:25,Sunday,1,,from the GitHub watcher log
+opened,2026-11-06,Friday,1:30 PM,2026-10-25 13:56:43,Sunday,12,,you booked this one
