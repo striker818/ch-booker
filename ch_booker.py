@@ -141,12 +141,15 @@ CLICK_DATE_JS = r"""([mon, day]) => {
     if (re.test(t) && (!best || best.contains(el))) best = el;
   }
   if (!best) return false;
+  const button = best.closest('button');
+  if (button && button.getAttribute('aria-disabled') === 'true') return false;  // greyed out
   best.scrollIntoView({block: 'center', inline: 'center'});
   best.click();
   return true;
 }"""
 
-# Every date tile in the picker ("Sun 25 Oct"), earliest first, as [mon, day].
+# Every bookable date tile in the picker ("Sun 25 Oct"), earliest first, as [mon, day].
+# The newest day can show up greyed out (aria-disabled) before it opens; those are skipped.
 LIST_DATES_JS = r"""() => {
   const re = /^\s*[A-Za-z]{3}\s+(\d{1,2})\s+([A-Za-z]{3})\s*$/;
   const tiles = [];
@@ -157,7 +160,10 @@ LIST_DATES_JS = r"""() => {
     if (last && last.el.contains(el)) tiles.pop();   // keep the innermost match
     tiles.push({el, mon: m[2], day: Number(m[1])});
   }
-  return tiles.map(t => [t.mon, t.day]);
+  return tiles
+    .filter(t => { const b = t.el.closest('button');
+                   return !(b && b.getAttribute('aria-disabled') === 'true'); })
+    .map(t => [t.mon, t.day]);
 }"""
 
 # Waitwhile's location prompt. Granting it up front means no popup.
@@ -207,10 +213,11 @@ def note_last_date(state, last):
     """Called every check with the last bookable day. Records when a new one appears."""
     now = datetime.now(STORE_TZ)
     prev, prev_check = state.get("last_date"), state.get("last_check")
-    if prev and last != prev and prev_check:
+    if prev and prev_check and slot_date(last, now) > slot_date(prev, now):
         before = datetime.fromisoformat(prev_check)
         if (now - before).total_seconds() < 15 * 60:
-            state.setdefault("releases", []).append({"after": prev_check, "seen": now.isoformat()})
+            state.setdefault("releases", []).append({"after": prev_check, "seen": now.isoformat(),
+                                                     "kind": "bookable"})
             msg = (f"New day {last} was added between {before:%I:%M:%S %p} and "
                    f"{now:%I:%M:%S %p} New York time.")
             log(f"{msg} Will check fast around then every day.")
@@ -329,7 +336,7 @@ def merge_github_releases(state):
     if not text:
         return
     try:
-        theirs = json.loads(text).get("releases", [])
+        theirs = real_releases(json.loads(text))
     except ValueError:
         return
     mine = state.setdefault("releases", [])
@@ -374,7 +381,7 @@ def print_report(slug):
                  if Path(__file__).with_name(f"ch_release_{slug}.json").exists() else None):
         if text:
             known = {r["seen"] for r in state["releases"]}
-            state["releases"] += [r for r in json.loads(text).get("releases", [])
+            state["releases"] += [r for r in real_releases(json.loads(text))
                                   if r["seen"] not in known]
     opened = [r for r in rows if r["event"] == "opened"]
     taken = [r for r in rows if r["event"] == "taken" and r["open_for_minutes"] and not r["note"]]
@@ -383,7 +390,7 @@ def print_report(slug):
     print("(GitHub tracker + this Mac combined"
           f"{'' if gh_csv is not None else ' - GitHub unreachable, Mac only'}; "
           "GitHub saves at the end of each ~5.5-hour run)\n")
-    rel = state.get("releases", [])
+    rel = real_releases(state)
     print(f"New days added to the booking window: {len(rel)} seen")
     for r in rel:
         print(f"   {datetime.fromisoformat(r['seen']).astimezone(STORE_TZ):%a %b %d}, "
@@ -426,10 +433,16 @@ def print_report(slug):
     print()
 
 
+def real_releases(state):
+    """Release records from when a day became bookable. Older records (no "kind") were
+    logged when a greyed-out tile merely appeared, so they don't count."""
+    return [r for r in state.get("releases", []) if r.get("kind") == "bookable"]
+
+
 def release_seconds(state):
     """Usual release time as seconds after midnight New York time, or None if not seen yet."""
     secs = []
-    for r in state.get("releases", [])[-7:]:
+    for r in real_releases(state)[-7:]:
         t = datetime.fromisoformat(r["seen"]).astimezone(STORE_TZ)
         secs.append(t.hour * 3600 + t.minute * 60 + t.second)
     return sorted(secs)[len(secs) // 2] if secs else None
