@@ -271,6 +271,7 @@ def note_greyed(state, greyed, tiles):
     for day in sorted(grey_now - set(before), key=lambda d: slot_date(d, now)):
         log(f"{day} showed up greyed out (on the calendar but not bookable yet) - watching "
             f"for it to open")
+        state.setdefault("greyed_history", []).append({"day": day, "seen": now.isoformat()})
     opened = {day: since for day, since in before.items() if day in bookable}
     for day, since in opened.items():
         hours = (now - datetime.fromisoformat(since)).total_seconds() / 3600
@@ -388,6 +389,11 @@ def record_openings(state, slots):
 
     state["open_slots"] = {f"{d}|{t}": prev.get((d, t), now.isoformat()) for d, t in slots}
     state["slots_checked"] = now.isoformat()
+    # How often anything at all was bookable - the app's "how hard is it" number.
+    stats = state.setdefault("stats", {"checks": 0, "checks_open": 0, "since": now.isoformat()})
+    stats["checks"] += 1
+    stats["checks_open"] += bool(slots)
+    stats["last"] = now.isoformat()
     save_state(state)
 
 
