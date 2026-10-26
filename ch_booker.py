@@ -93,6 +93,13 @@ STOP_AFTER_SECONDS = int(_m.group(1)) * 60 if _m else None
 # (Mac at :00, :10, :20..., GitHub with --stagger at :05, :15, :25...), so together
 # the page gets looked at every 5 seconds.
 STAGGER = "--stagger" in sys.argv
+# --phase N: start each check N seconds into its slot instead (the app spreads its trackers
+# and booking apart this way so they don't load the page at the same moment).
+_p = re.search(r"--phase[= ]([\d.]+)", " ".join(sys.argv))
+PHASE = float(_p.group(1)) if _p else None
+# --store <Waitwhile link>: the store learn/report use (the app runs one tracker per store).
+_s = re.search(r"--store[= ](\S+)", " ".join(sys.argv))
+STORE_ARG = _s.group(1) if _s else None
 
 # New days get added to the booking window once a day. The script records when
 # it sees that happen and checks every FAST_EVERY_SECONDS around that time.
@@ -150,13 +157,31 @@ def load_settings():
         return {}
 
 
+def store_name(url, settings):
+    """The name the app saved for a store link, or the link's last part."""
+    for name, saved in settings.get("stores", {}).items():
+        if saved.rstrip("/") == url.rstrip("/"):
+            return name
+    return url.rstrip("/").split("/")[-1]
+
+
 def apply_settings(settings):
-    """Adds the "custom" booking mode (the app's chosen location, days and times) and
-    points "learn" at the chosen location."""
+    """Applies the app's choices: party size and guest names, the "custom" booking mode
+    (chosen store, days and times), and which store "learn" watches."""
+    global PARTY_SIZE, GUEST_NAMES
+    if settings.get("party_size"):
+        PARTY_SIZE = str(settings["party_size"])
+    if "guest_names" in settings:
+        guests = [n.strip() for n in settings["guest_names"][:int(PARTY_SIZE) - 1] if n.strip()]
+        GUEST_NAMES = ", ".join(guests) or "N/A"     # the form asks for N/A when no guests
     url, name = settings.get("location_url"), settings.get("location_name", "Chrome Hearts")
+    if STORE_ARG:
+        MODES["learn"].update(url=STORE_ARG, name=f"{store_name(STORE_ARG, settings)} "
+                                                  f"(WATCH ONLY - never books)")
     if not url:
         return
-    MODES["learn"].update(url=url, name=f"{name} (WATCH ONLY - never books)")
+    if not STORE_ARG:
+        MODES["learn"].update(url=url, name=f"{name} (WATCH ONLY - never books)")
     dates = [datetime.strptime(d, "%Y-%m-%d") for d in sorted(settings.get("dates", []))]
     if dates:
         earliest, latest = settings.get("earliest"), settings.get("latest")
@@ -254,6 +279,22 @@ def alert(title, msg, url=""):
             log(f"(phone push failed: {e})")
 
 
+def read_state(path):
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return {}
+
+
+def merge_releases(state, other):
+    """Adds the other file's release times (when days became bookable) to state."""
+    known = {r["seen"] for r in state.get("releases", [])}
+    new = [r for r in real_releases(other) if r["seen"] not in known]
+    if new:
+        state.setdefault("releases", []).extend(new)
+        state["releases"].sort(key=lambda r: r["seen"])
+
+
 def load_state():
     try:
         return json.loads(STATE_FILE.read_text())
@@ -268,10 +309,12 @@ def note_greyed(state, greyed, tiles):
     before = state.get("greyed", {})
     grey_now = {f"{m} {d}" for m, d in greyed}
     bookable = {f"{m} {d}" for m, d in tiles}
+    first_look = "last_check" not in state     # was already greyed before tracking began
     for day in sorted(grey_now - set(before), key=lambda d: slot_date(d, now)):
-        log(f"{day} showed up greyed out (on the calendar but not bookable yet) - watching "
-            f"for it to open")
-        state.setdefault("greyed_history", []).append({"day": day, "seen": now.isoformat()})
+        log(f"{day} {'is' if first_look else 'showed up'} greyed out (on the calendar but not "
+            f"bookable yet) - watching for it to open")
+        if not first_look:
+            state.setdefault("greyed_history", []).append({"day": day, "seen": now.isoformat()})
     opened = {day: since for day, since in before.items() if day in bookable}
     for day, since in opened.items():
         hours = (now - datetime.fromisoformat(since)).total_seconds() / 3600
@@ -362,6 +405,12 @@ def record_openings(state, slots):
     last_scan = state.get("slots_checked")
     gap = (now - datetime.fromisoformat(last_scan)).total_seconds() if last_scan else None
     unsure = gap is None or gap > 15 * 60   # script was off, so timings are rough
+    if last_scan is None and slots:
+        # First look at this store: whatever is open now was already open, not an opening.
+        log(f"{len(slots)} time slots already open at the first check - noted as the starting "
+            f"point, not counted as openings")
+        prev = {s_: now.isoformat() for s_ in slots}
+        state["baseline_slots"] = [f"{d}|{t}" for d, t in slots]
 
     for day, t in sorted(slots - set(prev)):
         appt = slot_date(day, now)
@@ -384,7 +433,9 @@ def record_openings(state, slots):
                        "seen_weekday": now.strftime("%A"),
                        "days_ahead": (appt - now.date()).days,
                        "open_for_minutes": f"{mins:.1f}",
-                       "note": "script was off for a while, so this is a rough upper bound"
+                       "note": "already open when tracking started, so this is a lower bound"
+                               if f"{day}|{t}" in state.get("baseline_slots", []) else
+                               "script was off for a while, so this is a rough upper bound"
                                if unsure else ""})
 
     state["open_slots"] = {f"{d}|{t}": prev.get((d, t), now.isoformat()) for d, t in slots}
@@ -482,6 +533,30 @@ def print_report(slug):
         print("   none yet")
         return
 
+    # Every opening: the appointment (store's New York time) and the moment it opened
+    # (Central time, the user's own clock), plus how long it lasted when that was measured.
+    central = ZoneInfo("America/Chicago")
+    print("\nEvery opening found  (appointment in NY time  ·  when it opened, Central time)")
+    for r in opened:
+        appt = datetime.fromisoformat(r["appointment_date"])
+        seen_ny = datetime.strptime(r["seen_at_ny"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=STORE_TZ)
+        seen_ct = seen_ny.astimezone(central)
+        gone = next((t for t in rows if t["event"] == "taken"
+                     and t["appointment_date"] == r["appointment_date"]
+                     and t["appointment_time"] == r["appointment_time"]
+                     and t["seen_at_ny"] >= r["seen_at_ny"]), None)
+        if "booked" in r.get("note", ""):
+            lasted = "you booked it"
+        elif gone and gone["open_for_minutes"] and not gone["note"]:
+            secs = float(gone["open_for_minutes"]) * 60
+            lasted = f"gone in {secs:.0f} s" if secs < 90 else f"gone in {secs / 60:.0f} min"
+        elif gone:
+            lasted = "gone (exact time unknown - tracker was paused)"
+        else:
+            lasted = "how long it lasted wasn't measured"
+        print(f"   {appt:%a %b %-d %Y}, {r['appointment_time']} NY  ·  "
+              f"opened {seen_ct:%a %b %-d, %-I:%M:%S %p} CT  ·  {lasted}")
+
     def show(title, values, order=None):
         c = Counter(values)
         keys = order if order else [k for k, _ in c.most_common()]
@@ -546,7 +621,7 @@ def next_wait(state, normal_every):
     normal_every seconds (FAST_EVERY_SECONDS near the release time), shifted by half
     a slot with --stagger. A check that runs long just takes the next free slot."""
     period = wait_period(state, normal_every)
-    phase = period / 2 if STAGGER else 0
+    phase = PHASE % period if PHASE is not None else (period / 2 if STAGGER else 0)
     now = time.time()
     next_slot = math.floor((now - phase) / period) * period + phase + period
     return next_slot - now
@@ -640,7 +715,9 @@ def fill_and_book(page, time_text, dry_run):
     page.get_by_placeholder("Last name").fill(LAST_NAME)
     page.get_by_placeholder("Phone number").fill(PHONE)
     page.get_by_placeholder("Email").fill(EMAIL)
-    page.get_by_placeholder("Enter", exact=True).first.fill(GUEST_NAMES)
+    guests = page.get_by_placeholder("Enter", exact=True)
+    if guests.count():
+        guests.first.fill(GUEST_NAMES)
     answer_yes_dropdowns(page)
     page.wait_for_timeout(500)
 
@@ -665,7 +742,7 @@ def main():
     if not SERVER:   # GitHub always tracks New York; the app's choices are for this Mac
         apply_settings(load_settings())
     if mode == "report":
-        print_report(MODES["learn"]["url"].rstrip("/").split("/")[-1])
+        print_report((STORE_ARG or MODES["learn"]["url"]).rstrip("/").split("/")[-1])
         return
     if mode not in MODES:
         print("Start it with one of these:\n"
@@ -688,9 +765,20 @@ def main():
         sys.exit(1)
     global STATE_FILE, OPENINGS_FILE
     slug = cfg['url'].rstrip('/').split('/')[-1]
-    STATE_FILE = Path(__file__).with_name(f"ch_release_{slug}.json")
+    tracker_file = Path(__file__).with_name(f"ch_release_{slug}.json")
+    # A booking can run while a tracker watches the same store, so it keeps its own file
+    # (two programs rewriting one file would wipe each other's notes) and just reads the
+    # tracker's release times.
+    booking = not cfg.get("watch_only") and not SERVER
+    STATE_FILE = Path(__file__).with_name(f"ch_booking_{slug}.json") if booking else tracker_file
     OPENINGS_FILE = Path(__file__).with_name(f"ch_openings_{slug}.csv")
     state = load_state()
+    if booking:
+        legacy = read_state(tracker_file)          # booked notes from before the split
+        for k, v in legacy.items():
+            if k.startswith("booked_"):
+                state.setdefault(k, v)
+        merge_releases(state, legacy)
     if not SERVER:
         merge_github_releases(state)
     booked_key = f"booked_{mode}"   # per mode, so the Nov 6 booking doesn't block the trip
@@ -742,6 +830,8 @@ def main():
                         log("couldn't read the date tiles")
                     label, times = None, []
                 else:
+                    if booking:   # pick up release times the tracker learned meanwhile
+                        merge_releases(state, read_state(tracker_file))
                     label, times = find_open_times(page, cfg["dates"], cfg.get("earliest"),
                                                    cfg.get("latest"))
                 if times:
