@@ -78,6 +78,8 @@ CHECK_EVERY_SECONDS = 10
 
 # --server: no browser window, no "press Enter" prompts, alerts go to your phone (ntfy).
 SERVER = "--server" in sys.argv
+# "Press Enter" prompts only when someone is at a Terminal (not on a server or in the app).
+INTERACTIVE = sys.stdin.isatty() and not SERVER
 # --minutes N: stop cleanly after N minutes (GitHub Actions jobs max out at 6 hours).
 _m = re.search(r"--minutes[= ](\d+)", " ".join(sys.argv))
 STOP_AFTER_SECONDS = int(_m.group(1)) * 60 if _m else None
@@ -169,6 +171,10 @@ LIST_DATES_JS = r"""() => {
 # Waitwhile's location prompt. Granting it up front means no popup.
 STORE_LOCATION = {"latitude": 40.7359, "longitude": -74.0036}  # West Village
 
+# The greyed-out date tiles (shown on the calendar but not bookable yet), as [mon, day].
+GREYED_DATES_JS = LIST_DATES_JS.replace("return !(b && b.getAttribute('aria-disabled') === 'true')",
+                                        "return !!(b && b.getAttribute('aria-disabled') === 'true')")
+
 
 def log(msg):
     print(f"[{datetime.now().strftime('%b %d %I:%M:%S %p')}] {msg}", flush=True)
@@ -209,17 +215,40 @@ def load_state():
         return {}
 
 
-def note_last_date(state, last):
+def note_greyed(state, greyed, tiles):
+    """Keeps track of greyed-out days: when each first showed up, and which just became
+    bookable. Returns {day: when it went grey} for days that opened since the last check."""
+    now = datetime.now(STORE_TZ)
+    before = state.get("greyed", {})
+    grey_now = {f"{m} {d}" for m, d in greyed}
+    bookable = {f"{m} {d}" for m, d in tiles}
+    for day in sorted(grey_now - set(before), key=lambda d: slot_date(d, now)):
+        log(f"{day} showed up greyed out (on the calendar but not bookable yet) - watching "
+            f"for it to open")
+    opened = {day: since for day, since in before.items() if day in bookable}
+    for day, since in opened.items():
+        hours = (now - datetime.fromisoformat(since)).total_seconds() / 3600
+        log(f"{day} became bookable after being greyed out for {hours:.1f} hours")
+    state["greyed"] = {day: before.get(day, now.isoformat()) for day in grey_now}
+    return opened
+
+
+def note_last_date(state, last, greyed_since=None):
     """Called every check with the last bookable day. Records when a new one appears."""
     now = datetime.now(STORE_TZ)
     prev, prev_check = state.get("last_date"), state.get("last_check")
     if prev and prev_check and slot_date(last, now) > slot_date(prev, now):
         before = datetime.fromisoformat(prev_check)
         if (now - before).total_seconds() < 15 * 60:
-            state.setdefault("releases", []).append({"after": prev_check, "seen": now.isoformat(),
-                                                     "kind": "bookable"})
-            msg = (f"New day {last} was added between {before:%I:%M:%S %p} and "
+            release = {"after": prev_check, "seen": now.isoformat(), "kind": "bookable"}
+            if greyed_since:
+                release["greyed_since"] = greyed_since
+            state.setdefault("releases", []).append(release)
+            msg = (f"New day {last} became bookable between {before:%I:%M:%S %p} and "
                    f"{now:%I:%M:%S %p} New York time.")
+            if greyed_since:
+                msg += (f" It had been greyed out since "
+                        f"{datetime.fromisoformat(greyed_since):%b %d %I:%M %p}.")
             log(f"{msg} Will check fast around then every day.")
             alert("New Chrome Hearts day added", msg)
         else:
@@ -631,13 +660,22 @@ def main():
             try:
                 go_to_date_picker(page, cfg["url"])
                 tiles = page.evaluate(LIST_DATES_JS)
+                greyed = page.evaluate(GREYED_DATES_JS)
+                if tiles:   # only future days waiting to open, not today once it's closed
+                    newest = slot_date(f"{tiles[-1][0]} {tiles[-1][1]}", datetime.now(STORE_TZ))
+                    greyed = [g for g in greyed
+                              if slot_date(f"{g[0]} {g[1]}", datetime.now(STORE_TZ)) > newest]
+                opened_from_grey = note_greyed(state, greyed, tiles)
                 if tiles:
-                    note_last_date(state, f"{tiles[-1][0]} {tiles[-1][1]}")
+                    last = f"{tiles[-1][0]} {tiles[-1][1]}"
+                    note_last_date(state, last, opened_from_grey.get(last))
                 if cfg.get("watch_only"):
                     if tiles:
                         slots = scan_open_slots(page, tiles)
                         record_openings(state, slots)
-                        log(f"Bookable through {tiles[-1][0]} {tiles[-1][1]} | open now: "
+                        grey_txt = (" | greyed: " + ", ".join(f"{m} {d}" for m, d in greyed)
+                                    if greyed else "")
+                        log(f"Bookable through {tiles[-1][0]} {tiles[-1][1]}{grey_txt} | open now: "
                             + (", ".join(f"{d} {t}" for d, t in sorted(slots)) or "nothing"))
                     else:
                         log("couldn't read the date tiles")
@@ -664,15 +702,19 @@ def main():
                             log(f"Still stuck on {slot} ({e}), retrying")
                         if SERVER:
                             time.sleep(next_wait(state, cfg.get("every", CHECK_EVERY_SECONDS)))
-                        else:
+                        elif INTERACTIVE:
                             input("\nFinish booking in the browser window. "
                                   "Press Enter to keep watching, or Control + C to quit... ")
+                        else:   # run from the app: no keyboard, so give you time instead
+                            log("Finish booking in the browser window - waiting 3 minutes "
+                                "before checking again")
+                            time.sleep(180)
                         continue
                     if result == "dry":
                         alert("Test worked",
                               f"Filled the whole form for {label} {times[0]}. "
                               f"Did NOT book. Screenshot: ch_test_form.png")
-                        if not SERVER:
+                        if INTERACTIVE:
                             input("\nTest done. Look over the form in the browser window, "
                                   "then press Enter to close (nothing was booked)... ")
                         return
@@ -681,7 +723,7 @@ def main():
                     alert("Chrome Hearts booked",
                           f"Booked {label} at {times[0]}. Check {EMAIL} for the confirmation.",
                           cfg["url"])
-                    if not SERVER:
+                    if INTERACTIVE:
                         input("\nBooked! Check your email for the confirmation. "
                               "Press Enter to close... ")
                     return
