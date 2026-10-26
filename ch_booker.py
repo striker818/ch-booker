@@ -48,6 +48,12 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+# On the Mac, Playwright's browser lives in Application Support instead of Caches, because
+# cleanup tools empty Caches. (Install there with the same PLAYWRIGHT_BROWSERS_PATH.)
+if sys.platform == "darwin":
+    os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH",
+                          str(Path.home() / "Library/Application Support/ms-playwright"))
+
 from playwright.sync_api import sync_playwright
 
 # ===================== YOUR INFO =====================
@@ -132,6 +138,46 @@ MODES = {
         "dry_run": False,
     },
 }
+
+# ----- choices made in the CH Booker app (ch_settings.json next to this script) -----
+SETTINGS_FILE = Path(__file__).with_name("ch_settings.json")
+
+
+def load_settings():
+    try:
+        return json.loads(SETTINGS_FILE.read_text())
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def apply_settings(settings):
+    """Adds the "custom" booking mode (the app's chosen location, days and times) and
+    points "learn" at the chosen location."""
+    url, name = settings.get("location_url"), settings.get("location_name", "Chrome Hearts")
+    if not url:
+        return
+    MODES["learn"].update(url=url, name=f"{name} (WATCH ONLY - never books)")
+    dates = [datetime.strptime(d, "%Y-%m-%d") for d in sorted(settings.get("dates", []))]
+    if dates:
+        earliest, latest = settings.get("earliest"), settings.get("latest")
+        times = f"{earliest or 'opening'} to {latest or 'closing'}"
+        MODES["custom"] = {
+            "url": url,
+            "name": f"{name} (REAL booking: {', '.join(d.strftime('%b %d') for d in dates)}, "
+                    f"{times})",
+            "dates": [(d.strftime("%b"), d.day) for d in dates],
+            "earliest": earliest, "latest": latest,
+            "dry_run": False,
+        }
+
+
+def in_time_range(t, earliest, latest):
+    """'1:30 PM' between earliest and latest (either can be None = no limit)."""
+    def mins(x):
+        d = datetime.strptime(x.replace(" ", "").upper(), "%I:%M%p")
+        return d.hour * 60 + d.minute
+    return ((not earliest or mins(t) >= mins(earliest)) and
+            (not latest or mins(t) <= mins(latest)))
 
 TIME_RE = re.compile(r"\b\d{1,2}:\d{2}\s?(?:AM|PM)\b")
 
@@ -517,9 +563,9 @@ def go_to_date_picker(page, url):
     page.wait_for_timeout(2500)
 
 
-def find_open_times(page, dates):
-    """Clicks each target date. Returns (label, [times]) for the first date with openings.
-    dates == "any" means every date the picker shows, earliest first."""
+def find_open_times(page, dates, earliest=None, latest=None):
+    """Clicks each target date. Returns (label, [times]) for the first date with openings
+    between earliest and latest. dates == "any" means every date the picker shows."""
     if dates == "any":
         dates = page.evaluate(LIST_DATES_JS)
         if not dates:
@@ -543,8 +589,12 @@ def find_open_times(page, dates):
             log(f"{label}: in window, no open times")
             continue
         times = list(dict.fromkeys(TIME_RE.findall(body)))
+        wanted = [t for t in times if in_time_range(t, earliest, latest)]
+        if wanted:
+            return label, wanted
         if times:
-            return label, times
+            log(f"{label}: open at {', '.join(times)} - outside your times, skipping")
+            continue
         log(f"{label}: couldn't read times, screenshot saved to ch_check.png")
         page.screenshot(path="ch_check.png")
     return None, []
@@ -606,8 +656,10 @@ def fill_and_book(page, time_text, dry_run):
 
 def main():
     mode = (sys.argv[1] if len(sys.argv) > 1 else "").lower()
+    if not SERVER:   # GitHub always tracks New York; the app's choices are for this Mac
+        apply_settings(load_settings())
     if mode == "report":
-        print_report("chromehearts")
+        print_report(MODES["learn"]["url"].rstrip("/").split("/")[-1])
         return
     if mode not in MODES:
         print("Start it with one of these:\n"
@@ -616,6 +668,7 @@ def main():
               "  python3 ch_booker.py nov6   (REAL booking, NYC West Village, first open day)\n"
               "  python3 ch_booker.py learn  (watch only, learns when new days open, never books)\n"
               "  python3 ch_booker.py report (patterns in the openings learn mode has seen)\n"
+              "  python3 ch_booker.py custom (REAL booking of the store, days and times picked in the app)\n"
               "  python3 ch_booker.py nyc    (REAL booking, NYC West Village, Jan 24-27)")
         return
     cfg = MODES[mode]
@@ -635,6 +688,8 @@ def main():
     if not SERVER:
         merge_github_releases(state)
     booked_key = f"booked_{mode}"   # per mode, so the Nov 6 booking doesn't block the trip
+    if mode == "custom":            # ...and per chosen days, so new days can be booked later
+        booked_key += "_" + "_".join(f"{m}{d}" for m, d in cfg["dates"])
     if state.get(booked_key) and not cfg["dry_run"]:
         log(f"Already booked {state[booked_key]} - not booking again. "
             f"Remove \"{booked_key}\" from {STATE_FILE.name} to start over.")
@@ -681,7 +736,8 @@ def main():
                         log("couldn't read the date tiles")
                     label, times = None, []
                 else:
-                    label, times = find_open_times(page, cfg["dates"])
+                    label, times = find_open_times(page, cfg["dates"], cfg.get("earliest"),
+                                                   cfg.get("latest"))
                 if times:
                     log(f"{label} open times: {', '.join(times)}. Grabbing {times[0]}...")
                     start = time.time()
