@@ -31,7 +31,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 355
     steps:
+      # Load the newest data when the run actually starts. Without this, a run that
+      # waited in line gets the copy from when it was scheduled, and its save clashes.
       - uses: actions/checkout@v4
+        with:
+          ref: main
 
       - uses: actions/setup-python@v5
         with:
