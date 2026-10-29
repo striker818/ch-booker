@@ -44,7 +44,7 @@ import subprocess
 import sys
 import time
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -109,6 +109,11 @@ STORE_TZ = ZoneInfo("America/New_York")
 FAST_EVERY_SECONDS = 5
 FAST_BEFORE_MIN = 10     # start fast checks this long before the usual release time
 FAST_AFTER_MIN = 20      # ...and keep going this long after
+# On GitHub in learn mode, right around a new day's expected opening, check every second.
+NEW_DAY_EVERY_SECONDS = 1
+NEW_DAY_BEFORE_SEC = 180
+NEW_DAY_AFTER_SEC = 180
+NEW_DAY_WATCH = False    # set in main(): SERVER and learn mode
 
 MODES = {
     "test": {
@@ -168,7 +173,12 @@ def store_name(url, settings):
 def apply_settings(settings):
     """Applies the app's choices: party size and guest names, the "custom" booking mode
     (chosen store, days and times), and which store "learn" watches."""
-    global PARTY_SIZE, GUEST_NAMES
+    global PARTY_SIZE, GUEST_NAMES, FIRST_NAME, LAST_NAME, PHONE, EMAIL
+    you = settings.get("you", {})                  # your own details, edited in the app
+    FIRST_NAME = you.get("first_name", "").strip() or FIRST_NAME
+    LAST_NAME = you.get("last_name", "").strip() or LAST_NAME
+    PHONE = re.sub(r"\D", "", you.get("phone", "")) or PHONE
+    EMAIL = you.get("email", "").strip() or EMAIL
     if settings.get("party_size"):
         PARTY_SIZE = str(settings["party_size"])
     if "guest_names" in settings:
@@ -330,7 +340,8 @@ def note_last_date(state, last, greyed_since=None):
     if prev and prev_check and slot_date(last, now) > slot_date(prev, now):
         before = datetime.fromisoformat(prev_check)
         if (now - before).total_seconds() < 15 * 60:
-            release = {"after": prev_check, "seen": now.isoformat(), "kind": "bookable"}
+            release = {"after": prev_check, "seen": now.isoformat(), "kind": "bookable",
+                       "day": last}
             if greyed_since:
                 release["greyed_since"] = greyed_since
             state.setdefault("releases", []).append(release)
@@ -387,6 +398,17 @@ def scan_open_slots(page, tiles):
             continue
         slots.update((f"{mon} {day}", t) for t in dict.fromkeys(TIME_RE.findall(body)))
     return slots
+
+
+def read_day_times(page, mon, day):
+    """Times open on one day (clicks it), or None if the day tile couldn't be clicked."""
+    if not page.evaluate(CLICK_DATE_JS, [mon, day]):
+        return None
+    wait_for_day(page, mon, day)
+    body = page.inner_text("body")
+    if "No available times this day" in body:
+        return []
+    return list(dict.fromkeys(TIME_RE.findall(body)))
 
 
 def write_opening(row):
@@ -604,8 +626,50 @@ def release_seconds(state):
     return sorted(secs)[len(secs) // 2] if secs else None
 
 
+def expected_new_day_seconds(state):
+    """When the earliest greyed day should open (seconds after midnight NY), or None.
+    11:26 AM normally, 12:26 PM for a Sunday; a past release of the same weekday wins."""
+    try:
+        now = datetime.now(STORE_TZ)
+        days = sorted(state.get("greyed", {}), key=lambda d: slot_date(d, now))
+        if not days:
+            return None
+        wd = slot_date(days[0], now).weekday()
+        for r in reversed(real_releases(state)):
+            if r.get("day") and slot_date(r["day"], now).weekday() == wd:
+                t = datetime.fromisoformat(r["seen"]).astimezone(STORE_TZ)
+                return t.hour * 3600 + t.minute * 60
+        return (12 if wd == 6 else 11) * 3600 + 26 * 60
+    except Exception:
+        return None
+
+
+def in_new_day_window(state):
+    """True within NEW_DAY_BEFORE/AFTER_SEC of the waiting day's expected opening. The end
+    is remembered in state, since the day leaves state["greyed"] once it opens."""
+    if not NEW_DAY_WATCH:
+        return False
+    now = datetime.now(STORE_TZ)
+    try:
+        if now < datetime.fromisoformat(state.get("new_day_window_until", "")):
+            return True
+    except Exception:
+        pass
+    exp = expected_new_day_seconds(state)
+    if exp is None:
+        return False
+    now_s = now.hour * 3600 + now.minute * 60 + now.second
+    diff = (now_s - exp + 43200) % 86400 - 43200
+    if -NEW_DAY_BEFORE_SEC <= diff <= NEW_DAY_AFTER_SEC:
+        state["new_day_window_until"] = (now + timedelta(seconds=NEW_DAY_AFTER_SEC - diff)).isoformat()
+        return True
+    return False
+
+
 def wait_period(state, normal_every=CHECK_EVERY_SECONDS):
     """Seconds between checks right now: FAST_EVERY_SECONDS near the release time."""
+    if in_new_day_window(state):
+        return NEW_DAY_EVERY_SECONDS
     rel = release_seconds(state)
     if rel is not None:
         now = datetime.now(STORE_TZ)
@@ -771,6 +835,17 @@ def fill_and_book(page, time_text, dry_run):
     return "booked"
 
 
+def keep_open(page):
+    """After a booking: leave the confirmation page exactly as it is until you close it."""
+    log("BOOKED - the browser stays open on the confirmation page and nothing touches it. "
+        "Close that window yourself when you're done (Control + C here would close it).")
+    try:
+        page.wait_for_event("close", timeout=0)   # just waits; never reloads or clicks
+    except Exception:
+        pass
+    log("Browser window closed - booking finished.")
+
+
 def main():
     mode = (sys.argv[1] if len(sys.argv) > 1 else "").lower()
     if not SERVER:   # GitHub always tracks New York; the app's choices are for this Mac
@@ -797,7 +872,8 @@ def main():
         print(f"Missing your details: {', '.join(missing)}. "
               f"Put them in ch_info.json (or CH_* environment variables).")
         sys.exit(1)
-    global STATE_FILE, OPENINGS_FILE
+    global STATE_FILE, OPENINGS_FILE, NEW_DAY_WATCH
+    NEW_DAY_WATCH = SERVER and bool(cfg.get("watch_only"))
     slug = cfg['url'].rstrip('/').split('/')[-1]
     tracker_file = Path(__file__).with_name(f"ch_release_{slug}.json")
     # A booking can run while a tracker watches the same store, so it keeps its own file
@@ -818,10 +894,8 @@ def main():
     booked_key = f"booked_{mode}"   # per mode, so the Nov 6 booking doesn't block the trip
     if mode == "custom":            # ...and per chosen days, so new days can be booked later
         booked_key += "_" + "_".join(f"{m}{d}" for m, d in cfg["dates"])
-    if state.get(booked_key) and not cfg["dry_run"]:
-        log(f"Already booked {state[booked_key]} - not booking again. "
-            f"Remove \"{booked_key}\" from {STATE_FILE.name} to start over.")
-        return
+    if state.get(booked_key) and not cfg["dry_run"]:   # a heads-up only; it books again anyway
+        log(f"Note: this already booked {state[booked_key]} earlier - booking again anyway")
     log(f"{cfg['name']} | watching {dates_txt} | {SERVICE}, party of {PARTY_SIZE}. "
         f"Control + C to stop.")
     log(f"{release_label(state)}{' | server mode' if SERVER else ''}")
@@ -833,7 +907,7 @@ def main():
         context = browser.new_context(permissions=["geolocation"],
                                       geolocation=STORE_LOCATION)
         page = context.new_page()
-        was_fast = False
+        was_fast = was_close = False
         alerted = {}
         started = time.time()
         checks_done = 0
@@ -843,7 +917,9 @@ def main():
                 return
             try:
                 checks_done += 1
-                open_date_picker(page, cfg["url"], full=checks_done % FULL_FLOW_EVERY == 1)
+                close = in_new_day_window(state)     # 1 s checks around a new day's opening
+                open_date_picker(page, cfg["url"],
+                                 full=not close and checks_done % FULL_FLOW_EVERY == 1)
                 tiles = page.evaluate(LIST_DATES_JS)
                 greyed = page.evaluate(GREYED_DATES_JS)
                 if tiles:   # only future days waiting to open, not today once it's closed
@@ -851,13 +927,35 @@ def main():
                     greyed = [g for g in greyed
                               if slot_date(f"{g[0]} {g[1]}", datetime.now(STORE_TZ)) > newest]
                 opened_from_grey = note_greyed(state, greyed, tiles)
+                new_day = False
                 if tiles:
                     last = f"{tiles[-1][0]} {tiles[-1][1]}"
+                    n_rel, prev_check = len(state.get("releases", [])), state.get("last_check")
                     note_last_date(state, last, opened_from_grey.get(last))
+                    new_day = len(state.get("releases", [])) > n_rel
                 if cfg.get("watch_only"):
                     if tiles:
-                        slots = scan_open_slots(page, tiles)
+                        day_times = None
+                        if close:   # only the newest day, so the first look is fast
+                            day_times = read_day_times(page, *tiles[-1])
+                            slots = {tuple(k.split("|")) for k in state.get("open_slots", {})}
+                            if day_times is not None:
+                                slots = {s for s in slots if s[0] != last}
+                                slots.update((last, t) for t in day_times)
+                        else:
+                            slots = scan_open_slots(page, tiles)
+                            day_times = sorted(t for d, t in slots if d == last)
+                        looked = datetime.now(STORE_TZ)
+                        if NEW_DAY_WATCH and new_day and day_times is not None:
+                            state.setdefault("new_day_openings", []).append(
+                                {"day": last, "bookable_after": prev_check,
+                                 "bookable_seen": state.get("last_check"),
+                                 "first_look_at": looked.isoformat(),
+                                 "first_look_slots": day_times})
+                            log(f"FIRST LOOK at {last} ({looked:%I:%M:%S %p} NY): "
+                                f"{', '.join(day_times) or 'nothing open'}")
                         record_openings(state, slots)
+                        save_state(state)
                         grey_txt = (" | greyed: " + ", ".join(f"{m} {d}" for m, d in greyed)
                                     if greyed else "")
                         log(f"Bookable through {tiles[-1][0]} {tiles[-1][1]}{grey_txt} | open now: "
@@ -911,9 +1009,7 @@ def main():
                     alert("Chrome Hearts booked",
                           f"Booked {label} at {times[0]}. Check {EMAIL} for the confirmation.",
                           cfg["url"])
-                    if INTERACTIVE:
-                        input("\nBooked! Check your email for the confirmation. "
-                              "Press Enter to close... ")
+                    keep_open(page)
                     return
             except KeyboardInterrupt:
                 raise
@@ -924,7 +1020,12 @@ def main():
                 except Exception:
                     pass
             wait = next_wait(state, cfg.get("every", CHECK_EVERY_SECONDS))
-            fast = wait_period(state) == FAST_EVERY_SECONDS
+            period = wait_period(state)
+            fast = period <= FAST_EVERY_SECONDS     # the 1 s window counts as fast too
+            if (period == NEW_DAY_EVERY_SECONDS) != was_close:
+                was_close = period == NEW_DAY_EVERY_SECONDS
+                log("New day opening close: checking every second" if was_close
+                    else "New day opening window over: back to normal checks")
             if fast != was_fast:
                 log("Release time is close: checking every few seconds" if fast
                     else "Past the release window: back to normal checks")
